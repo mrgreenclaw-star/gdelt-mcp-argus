@@ -41,10 +41,31 @@ async function gdeltRaw(params) {
 }
 
 async function gdelt(params) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { status, text } = await schedule(() => gdeltRaw(params));
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let status, text;
+    try {
+      ({ status, text } = await schedule(() => gdeltRaw(params)));
+    } catch (e) {
+      const cause = e.cause?.code || e.name || e.message;
+      console.log(`gdelt ${params.mode} -> network error: ${cause}`);
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await sleep(3000);
+        continue;
+      }
+      throw new Error(`GDELT unreachable from server (${cause})`);
+    }
     const trimmed = text.trim();
-    if (!trimmed) return {}; // GDELT returns empty body when nothing matches
+    console.log(`gdelt ${params.mode} -> HTTP ${status}, ${trimmed.length} bytes`);
+    if (status === 429 || /limit requests/i.test(trimmed)) {
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await sleep(10000 * (attempt + 1));
+        continue;
+      }
+      throw new Error("GDELT rate limit (HTTP 429) persisted after retries; wait a few minutes before the next call");
+    }
+    if (status !== 200) throw new Error(`GDELT error (HTTP ${status}): ${trimmed.slice(0, 300)}`);
+    if (!trimmed) return {}; // HTTP 200 with empty body = no matches
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
         return JSON.parse(trimmed);
@@ -57,13 +78,9 @@ async function gdelt(params) {
         }
       }
     }
-    if (/limit requests/i.test(trimmed) && attempt === 0) {
-      await sleep(MIN_INTERVAL_MS);
-      continue;
-    }
     throw new Error(`GDELT error (HTTP ${status}): ${trimmed.slice(0, 300)}`);
   }
-  throw new Error("GDELT rate limit: try again in a few seconds");
+  throw new Error("GDELT request failed after retries");
 }
 
 // ---------- helpers ----------
