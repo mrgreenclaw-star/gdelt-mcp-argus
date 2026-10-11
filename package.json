@@ -1,0 +1,15 @@
+{
+  "name": "gdelt-mcp-argus",
+  "version": "1.0.0",
+  "description": "Zero-dependency MCP server (Streamable HTTP) for GDELT DOC 2.0 news coverage and tone",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
