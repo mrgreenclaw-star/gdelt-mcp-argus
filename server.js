@@ -1,6 +1,9 @@
 // GDELT MCP server for Argus — zero dependencies, MCP Streamable HTTP (stateless JSON responses).
 // Data: GDELT DOC 2.0 API (free, no key). https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
+// Markets/macro: Yahoo Finance, FRED, US Treasury Fiscal Data (see markets.js, analyst.js).
 import http from "node:http";
+import { pathToFileURL } from "node:url";
+import { ANALYST_TOOLS, callAnalystTool, PROMPTS, getPrompt } from "./analyst.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const PATH_TOKEN = (process.env.PATH_TOKEN || "").trim();
@@ -8,7 +11,7 @@ const MCP_PATH = PATH_TOKEN ? `/mcp/${PATH_TOKEN}` : "/mcp";
 const GDELT_URL = process.env.GDELT_URL || "https://api.gdeltproject.org/api/v2/doc/doc";
 const MIN_INTERVAL_MS = Number(process.env.GDELT_MIN_INTERVAL_MS || 5500);
 const FETCH_TIMEOUT_MS = 25000;
-const SERVER_INFO = { name: "gdelt-mcp-argus", version: "1.0.0" };
+const SERVER_INFO = { name: "gdelt-mcp-argus", version: "1.1.0" };
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 // ---------- GDELT client with a serial rate-limit queue ----------
@@ -193,9 +196,20 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
+  ...ANALYST_TOOLS,
 ];
 
+// News feed for analyst_brief: tone stats + top headlines (2 GDELT calls).
+async function newsDigest(query, timespan, headlines) {
+  const tp = { timespan };
+  const tone = series(await gdelt({ query, mode: "TimelineTone", ...tp }));
+  const arts = articles(await gdelt({ query, mode: "ArtList", maxrecords: String(headlines), sort: "HybridRel", ...tp }));
+  return { query, timespan, tone_stats: stats(tone), headlines: arts };
+}
+
 async function callTool(name, args = {}) {
+  const analyst = await callAnalystTool(name, args, { news: newsDigest });
+  if (analyst !== undefined) return analyst;
   const tp = timeParams(args);
   if (name === "gdelt_search") {
     const q = buildQuery(args.query, args.source_country, args.source_lang);
@@ -236,7 +250,7 @@ async function callTool(name, args = {}) {
 }
 
 // ---------- JSON-RPC / MCP ----------
-async function handleRpc(msg) {
+export async function handleRpc(msg) {
   const { id, method, params } = msg || {};
   const isNotification = id === undefined || id === null;
   const ok = (result) => ({ jsonrpc: "2.0", id, result });
@@ -251,10 +265,10 @@ async function handleRpc(msg) {
       const protocolVersion = SUPPORTED_VERSIONS.includes(req) ? req : SUPPORTED_VERSIONS[0];
       return ok({
         protocolVersion,
-        capabilities: { tools: { listChanged: false } },
+        capabilities: { tools: { listChanged: false }, prompts: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "GDELT DOC 2.0 news-coverage tools. Results describe media coverage and tone, not verified facts. Calls are rate-limited (~5s each).",
+          "Argus analyst toolkit. analyst_brief gives a one-call research pack per coverage area (gold, dollar, bitcoin, treasuries, oil, equities, geopolitics, us_macro, fed, inflation, us_debt, wars); market_snapshot / macro_indicator / us_debt / asset_correlation for specifics; gdelt_* for news coverage and tone (media coverage, not verified facts; rate-limited ~5s per call). Use the argus_analyst prompt for the methodology.",
       });
     }
     case "ping":
@@ -273,7 +287,14 @@ async function handleRpc(msg) {
     case "resources/list":
       return ok({ resources: [] });
     case "prompts/list":
-      return ok({ prompts: [] });
+      return ok({ prompts: PROMPTS });
+    case "prompts/get": {
+      try {
+        return ok(getPrompt(params?.name, params?.arguments || {}));
+      } catch (e) {
+        return err(e.code || -32603, e.message);
+      }
+    }
     default:
       return err(-32601, `Method not found: ${method}`);
   }
@@ -315,4 +336,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.requestTimeout = 120000;
-server.listen(PORT, () => console.log(`gdelt-mcp-argus listening on :${PORT}${MCP_PATH === "/mcp" ? " /mcp" : " (token path)"}`));
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(PORT, () => console.log(`gdelt-mcp-argus listening on :${PORT}${MCP_PATH === "/mcp" ? " /mcp" : " (token path)"}`));
+}

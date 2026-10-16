@@ -1,7 +1,7 @@
 {
   "name": "gdelt-mcp-argus",
-  "version": "1.0.0",
-  "description": "Zero-dependency MCP server (Streamable HTTP) for GDELT DOC 2.0 news coverage and tone",
+  "version": "1.1.0",
+  "description": "Zero-dependency MCP server (Streamable HTTP) for the Argus analyst: GDELT news tone plus market, macro, Fed, inflation and US debt data",
   "type": "module",
   "main": "server.js",
   "scripts": {
