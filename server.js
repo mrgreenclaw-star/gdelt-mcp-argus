@@ -337,5 +337,24 @@ const server = http.createServer(async (req, res) => {
 
 server.requestTimeout = 120000;
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  server.listen(PORT, () => console.log(`gdelt-mcp-argus listening on :${PORT}${MCP_PATH === "/mcp" ? " /mcp" : " (token path)"}`));
+  server.listen(PORT, () => {
+    console.log(`gdelt-mcp-argus listening on :${PORT}${MCP_PATH === "/mcp" ? " /mcp" : " (token path)"}`);
+    if (process.env.SELFTEST_TOOL) selfTest(process.env.SELFTEST_TOOL, process.env.SELFTEST_ARGS);
+  });
+}
+
+// Optional boot-time smoke test: runs one tool against live sources and prints the result to the logs
+// (for hosts where the MCP endpoint itself can't be reached by the operator).
+async function selfTest(name, rawArgs) {
+  const t0 = Date.now();
+  try {
+    const data = await callTool(name, rawArgs ? JSON.parse(rawArgs) : {});
+    const text = JSON.stringify(data);
+    const CHUNK = 3000;
+    const parts = Math.ceil(text.length / CHUNK);
+    for (let i = 0; i < parts; i++) console.log(`SELFTEST ${name} ${i + 1}/${parts} ${text.slice(i * CHUNK, (i + 1) * CHUNK)}`);
+    console.log(`SELFTEST ${name} done in ${Date.now() - t0}ms, ${text.length} bytes`);
+  } catch (e) {
+    console.log(`SELFTEST ${name} failed: ${e.message}`);
+  }
 }
