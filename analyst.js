@@ -1,5 +1,5 @@
 // Argus analyst layer: asset & macro catalogs, per-direction briefs, analyst prompt.
-import { yahooDaily, fredSeries, treasuryDebt, treasuryAvgRate, priceStats, macroStats, correlation, shiftDate } from "./markets.js";
+import { yahooDaily, fredSeries, treasuryDebt, treasuryAvgRate, priceStats, macroStats, correlation, periodChange, shiftDate } from "./markets.js";
 
 // ---------- catalogs ----------
 // yahoo: primary source; fred: fallback series (may differ, see note).
@@ -71,6 +71,133 @@ export const MACRO = {
   federal_deficit: { id: "MTSDS133FMS", name: "Monthly federal surplus(+)/deficit(-) ($ mn)", transform: "level" },
 };
 
+// ---------- cross-asset relationships (for the divergence detector) ----------
+// asset should respond to driver with sign `expect` (+1 same direction, -1 opposite).
+// Refs: asset keys, or 'macro:<key>' for a FRED rate series (moves measured in bp).
+export const RELATIONSHIPS = {
+  gold_real_yield: { asset: "gold", driver: "macro:real_yield_10y", expect: -1, why: "реальная ставка = альтернативная стоимость золота" },
+  gold_dollar: { asset: "gold", driver: "dxy", expect: -1, why: "золото номинировано в долларах" },
+  gold_haven: { asset: "gold", driver: "vix", expect: 1, why: "золото как защитный актив при стрессе" },
+  btc_nasdaq: { asset: "btc", driver: "ndx", expect: 1, why: "BTC торгуется как высокобетный risk-актив" },
+  btc_dollar: { asset: "btc", driver: "dxy", expect: -1, why: "сильный доллар = жёсткая глобальная ликвидность" },
+  yields_oil: { asset: "ust10y", driver: "brent", expect: 1, why: "нефть → инфляционные ожидания → доходности" },
+  breakeven_oil: { asset: "macro:breakeven_10y", driver: "brent", expect: 1, why: "нефть напрямую в инфляционных ожиданиях" },
+  dollar_2y: { asset: "dxy", driver: "ust2y", expect: 1, why: "дифференциал коротких ставок" },
+  yen_yields: { asset: "usdjpy", driver: "ust10y", expect: 1, why: "дифференциал ставок США–Япония" },
+  equities_vix: { asset: "spx", driver: "vix", expect: -1, why: "рост страха = падение акций" },
+  dax_us: { asset: "dax", driver: "ndx", expect: 1, why: "глобальная синхронность рынков акций" },
+  nikkei_us: { asset: "nikkei", driver: "ndx", expect: 1, why: "глобальная синхронность, вес техсектора" },
+  nikkei_yen: { asset: "nikkei", driver: "usdjpy", expect: 1, why: "слабая иена поддерживает экспортёров" },
+  hsi_us: { asset: "hsi", driver: "spx", expect: 1, why: "глобальная синхронность рынков акций" },
+};
+
+async function resolveSeries(ref, range) {
+  if (ref.startsWith("macro:") || ref.startsWith("fred:")) {
+    const key = ref.split(":")[1];
+    const id = ref.startsWith("macro:") ? MACRO[key]?.id : key;
+    if (!id) throw new Error(`unknown macro key '${key}'`);
+    return { key: ref, name: MACRO[key]?.name || id, kind: "yield", source: `FRED ${id}`, pts: await fredSeries(id) };
+  }
+  return assetSeries(ref, range);
+}
+
+const DIV_Z = 0.75; // both legs must move at least this many "typical" sigmas to call a divergence
+const NONCONF_DRIVER_Z = 1; // driver moved a lot ...
+const NONCONF_ASSET_Z = 0.25; // ... but asset barely responded in the expected direction
+
+export async function detectDivergences(ids, from, to) {
+  const rels = ids.map((id) => [id, RELATIONSHIPS[id]]).filter(([, r]) => r);
+  const refs = [...new Set(rels.flatMap(([, r]) => [r.asset, r.driver]))];
+  const loaded = Object.fromEntries(await Promise.all(refs.map(async (ref) => {
+    try {
+      return [ref, await resolveSeries(ref, "2y")];
+    } catch (e) {
+      return [ref, { error: e.message }];
+    }
+  })));
+  const out = [];
+  for (const [id, r] of rels) {
+    const A = loaded[r.asset], D = loaded[r.driver];
+    const row = { id, asset: r.asset, driver: r.driver, expected: r.expect > 0 ? "same direction" : "opposite", why: r.why };
+    if (A.error || D.error) {
+      out.push({ ...row, status: "error", error: A.error || D.error });
+      continue;
+    }
+    try {
+      const pa = periodChange(A.pts, from, to, A.kind), pd = periodChange(D.pts, from, to, D.kind);
+      row.asset_change = `${pa.change}${pa.change_unit}`;
+      row.driver_change = `${pd.change}${pd.change_unit}`;
+      row.asset_z = pa.z_score;
+      row.driver_z = pd.z_score;
+      if (pa.end_date !== pd.end_date) row.note = `data end dates differ: ${pa.end_date} vs ${pd.end_date}`;
+      // Asset's response in the expected direction, measured in its own sigmas.
+      const response = pa.z_score !== null && pd.z_score !== null ? pa.z_score * r.expect * Math.sign(pd.z_score) : null;
+      if (response === null) row.status = "insufficient history";
+      else if (Math.abs(pd.z_score) < DIV_Z) row.status = "quiet";
+      else if (response <= -DIV_Z) row.status = "divergence";
+      else if (Math.abs(pd.z_score) >= NONCONF_DRIVER_Z && response < NONCONF_ASSET_Z) row.status = "non_confirmation";
+      else row.status = "consistent";
+      const c60 = correlation(A.pts, D.pts, 60, A.kind, D.kind, to);
+      const c250 = correlation(A.pts, D.pts, 250, A.kind, D.kind, to);
+      row.corr_60d = c60?.corr ?? null;
+      row.corr_250d = c250?.corr ?? null;
+      if (c60 && c250) {
+        if (Math.sign(c60.corr) !== r.expect && Math.sign(c250.corr) === r.expect && Math.abs(c60.corr) >= 0.15) row.regime = "correlation flipped vs 1y norm";
+        else if (Math.abs(c60.corr - c250.corr) >= 0.4) row.regime = `correlation shifted ${c250.corr} → ${c60.corr}`;
+      }
+    } catch (e) {
+      row.status = "error";
+      row.error = e.message;
+    }
+    out.push(row);
+  }
+  const rank = { divergence: 0, non_confirmation: 1, consistent: 2, quiet: 3, "insufficient history": 4, error: 5 };
+  return out.sort((a, b) => rank[a.status] - rank[b.status] || Math.abs(b.driver_z || 0) - Math.abs(a.driver_z || 0));
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const today = () => new Date().toISOString().slice(0, 10);
+// Monday of the current week; on weekends — Monday of the week just finished.
+export function weekStart(iso = today()) {
+  const day = new Date(`${iso}T00:00:00Z`).getUTCDay();
+  return shiftDate(iso, -((day + 6) % 7));
+}
+function checkPeriod(from, to) {
+  if (!DATE_RE.test(from) || !DATE_RE.test(to)) throw new Error("dates must be YYYY-MM-DD");
+  if (from > to) throw new Error("from must be on or before to");
+}
+
+export const PERIOD_DEFAULT_ASSETS = ["gold", "silver", "dxy", "eurusd", "usdjpy", "btc", "ust2y", "ust10y", "ust30y", "brent", "wti", "spx", "ndx", "dax", "nikkei", "hsi", "vix"];
+
+export async function periodReport({ from, to, assets, include_daily = false, include_divergences = true } = {}) {
+  to = to || today();
+  from = from || weekStart(to);
+  checkPeriod(from, to);
+  const keys = (assets?.length ? assets : PERIOD_DEFAULT_ASSETS).slice(0, 25);
+  const rows = await Promise.all(keys.map(async (k) => {
+    try {
+      const s = await resolveSeries(k, "2y");
+      const pc = periodChange(s.pts, from, to, s.kind);
+      if (!include_daily) delete pc.daily;
+      return { asset: k, name: s.name, source: s.source, ...pc };
+    } catch (e) {
+      return { asset: k, error: e.message };
+    }
+  }));
+  const priced = rows.filter((r) => !r.error && r.change_unit === "%" && r.asset !== "vix");
+  const byChange = [...priced].sort((a, b) => b.change - a.change);
+  const unusual = rows.filter((r) => !r.error && r.z_score !== null && Math.abs(r.z_score) >= 1.5).map((r) => `${r.name}: ${r.change}${r.change_unit} (z=${r.z_score})`);
+  const out = {
+    period: { from, to, note: "change = last close before 'from' → last close on/before 'to'; z_score = move vs typical move of the prior year" },
+    assets: rows,
+    leaders: byChange.slice(0, 3).map((r) => `${r.name} ${r.change}%`),
+    laggards: byChange.slice(-3).reverse().map((r) => `${r.name} ${r.change}%`),
+    unusual_moves: unusual,
+  };
+  if (include_divergences) out.divergences = await detectDivergences(Object.keys(RELATIONSHIPS), from, to);
+  return out;
+}
+
 // ---------- directions (the analyst's coverage areas) ----------
 // news: GDELT queries; label is shown in the brief.
 export const DIRECTIONS = {
@@ -79,6 +206,7 @@ export const DIRECTIONS = {
     assets: ["gold", "silver", "dxy", "ust10y"],
     macro: ["real_yield_10y", "breakeven_10y", "fed_funds_upper"],
     correlations: [["gold", "dxy"], ["gold", "ust10y"]],
+    divergences: ["gold_real_yield", "gold_dollar", "gold_haven"],
     news: [{ label: "gold market", query: '("gold price" OR bullion OR "central bank gold")' }],
     drivers: [
       "Реальная доходность (10y TIPS): исторически главный обратный драйвер; в 2022–2025 связь ослабла из-за покупок ЦБ.",
@@ -92,6 +220,7 @@ export const DIRECTIONS = {
     assets: ["dxy", "eurusd", "usdjpy", "usdcny", "ust2y"],
     macro: ["fed_funds_upper", "ust_2y", "curve_10y2y", "dollar_broad"],
     correlations: [["dxy", "ust2y"]],
+    divergences: ["dollar_2y", "yen_yields", "gold_dollar"],
     news: [{ label: "dollar / FX", query: '("US dollar" OR "dollar index" OR DXY) (Fed OR tariffs OR yen OR euro)' }],
     drivers: [
       "Дифференциал ставок США vs ЕЦБ/BoJ (особенно 2-летки).",
@@ -105,6 +234,7 @@ export const DIRECTIONS = {
     assets: ["btc", "eth", "ndx", "dxy"],
     macro: ["fed_balance_sheet", "m2", "real_yield_10y"],
     correlations: [["btc", "ndx"], ["btc", "gold"]],
+    divergences: ["btc_nasdaq", "btc_dollar"],
     news: [{ label: "bitcoin", query: '(bitcoin OR "crypto ETF" OR "spot bitcoin")' }],
     drivers: [
       "Глобальная ликвидность (баланс ФРС, M2, реальные ставки).",
@@ -115,6 +245,7 @@ export const DIRECTIONS = {
   },
   treasuries: {
     title: "Облигации США (Treasuries)",
+    divergences: ["yields_oil", "breakeven_oil", "dollar_2y"],
     assets: ["ust3m", "ust2y", "ust10y", "ust30y"],
     macro: ["curve_10y2y", "curve_10y3m", "real_yield_10y", "breakeven_10y", "term_premium_10y", "fed_funds_upper"],
     news: [{ label: "Treasury market", query: '("Treasury yields" OR "Treasury auction" OR "bond market") (Fed OR deficit OR inflation)' }],
@@ -130,6 +261,7 @@ export const DIRECTIONS = {
     assets: ["brent", "wti", "natgas", "dxy"],
     macro: ["industrial_production", "breakeven_5y"],
     correlations: [["brent", "spx"]],
+    divergences: ["yields_oil", "breakeven_oil"],
     news: [
       { label: "OPEC+ / supply", query: '(OPEC OR "OPEC+" OR "oil output" OR "crude supply")' },
       { label: "energy chokepoints", query: '("Strait of Hormuz" OR "Red Sea" OR "oil tanker" OR "oil sanctions")' },
@@ -146,6 +278,7 @@ export const DIRECTIONS = {
     assets: ["spx", "ndx", "dax", "nikkei", "hsi", "vix"],
     macro: ["hy_spread", "financial_conditions", "real_yield_10y", "gdpnow"],
     correlations: [["spx", "dax"], ["spx", "nikkei"], ["spx", "hsi"]],
+    divergences: ["equities_vix", "dax_us", "nikkei_us", "nikkei_yen", "hsi_us"],
     news: [{ label: "equity markets", query: '("stock market" OR "Wall Street" OR equities) (earnings OR Fed OR selloff OR rally)' }],
     drivers: [
       "Прибыли (EPS-revisions) и мультипликатор (чувствителен к реальным ставкам).",
@@ -156,6 +289,7 @@ export const DIRECTIONS = {
   },
   geopolitics: {
     title: "Геополитика",
+    divergences: ["gold_haven", "equities_vix", "yields_oil"],
     assets: ["gold", "brent", "vix", "usdcny"],
     macro: [],
     news: [
@@ -184,6 +318,7 @@ export const DIRECTIONS = {
   },
   fed: {
     title: "ФРС",
+    divergences: ["dollar_2y", "yen_yields"],
     assets: ["ust2y", "ust3m", "dxy"],
     macro: ["fed_funds_upper", "fed_funds_effective", "fed_balance_sheet", "bank_reserves", "reverse_repo", "core_pce", "unemployment", "ust_2y"],
     news: [{ label: "Federal Reserve", query: '("Federal Reserve" OR FOMC) (rate OR "rate cut" OR "rate hike" OR "balance sheet")' }],
@@ -196,6 +331,7 @@ export const DIRECTIONS = {
   },
   inflation: {
     title: "Инфляция",
+    divergences: ["breakeven_oil", "yields_oil", "gold_real_yield"],
     assets: ["brent", "gold"],
     macro: ["cpi", "core_cpi", "pce", "core_pce", "wages", "breakeven_5y", "breakeven_10y", "inflation_5y5y", "inflation_expect_umich"],
     news: [{ label: "inflation", query: '(inflation OR CPI OR "consumer prices") ("United States" OR Fed)' }],
@@ -208,6 +344,7 @@ export const DIRECTIONS = {
   },
   us_debt: {
     title: "Госдолг США",
+    divergences: ["yields_oil", "gold_real_yield"],
     assets: ["ust10y", "ust30y", "gold"],
     macro: ["debt_to_gdp", "federal_interest", "federal_deficit", "term_premium_10y"],
     treasury: true,
@@ -221,6 +358,7 @@ export const DIRECTIONS = {
   },
   wars: {
     title: "Войны и вооружённые конфликты",
+    divergences: ["gold_haven", "yields_oil", "breakeven_oil", "equities_vix"],
     assets: ["brent", "gold", "natgas", "vix"],
     macro: [],
     news: [
@@ -353,7 +491,7 @@ async function settle(items, fn) {
   }));
 }
 
-export async function buildBrief(direction, { include_news = true, news_timespan = "7d", headlines = 5 } = {}, news) {
+export async function buildBrief(direction, { include_news = true, news_timespan = "7d", headlines = 5, from, to } = {}, news) {
   const d = DIRECTIONS[direction];
   if (!d) throw new Error(`Unknown direction '${direction}'. Use one of: ${Object.keys(DIRECTIONS).join(", ")}`);
   const [assets, macro] = await Promise.all([
@@ -380,10 +518,22 @@ export async function buildBrief(direction, { include_news = true, news_timespan
   if (d.correlations?.length) {
     out.correlations_60d = await settle(d.correlations, async ([x, y]) => {
       const [a, b] = await Promise.all([assetSeries(x), assetSeries(y)]);
-      return { pair: `${x}/${y}`, ...(correlation(a.pts, b.pts, 60) || { corr: null, note: "not enough overlapping data" }) };
+      return { pair: `${x}/${y}`, ...(correlation(a.pts, b.pts, 60, a.kind, b.kind) || { corr: null, note: "not enough overlapping data" }) };
     });
   }
   out.signals = signals(assets, macro);
+  if (d.divergences?.length) {
+    const end = to || today();
+    const start = from || shiftDate(end, -6);
+    checkPeriod(start, end);
+    out.divergence_period = { from: start, to: end };
+    out.divergences = await detectDivergences(d.divergences, start, end);
+    for (const v of out.divergences) {
+      if (v.status === "divergence") out.signals.push(`РАСХОЖДЕНИЕ: ${v.asset} ${v.asset_change} при ${v.driver} ${v.driver_change} — ожидалось ${v.expected === "opposite" ? "обратное" : "однонаправленное"} движение (${v.why})`);
+      if (v.status === "non_confirmation") out.signals.push(`НЕ ПОДТВЕРЖДЕНО: ${v.driver} ${v.driver_change} (z=${v.driver_z}), а ${v.asset} почти не отреагировал (${v.asset_change}) — связь «${v.why}» не работает`);
+      if (v.regime) out.signals.push(`СМЕНА РЕЖИМА ${v.asset}/${v.driver}: ${v.regime}`);
+    }
+  }
   if (include_news && news && d.news?.length) {
     out.news = [];
     for (const n of d.news) {
@@ -453,6 +603,35 @@ export const ANALYST_TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
+    name: "period_report",
+    description:
+      "Performance over an arbitrary period (e.g. Monday–Friday): change from the last close before 'from' to the last close on/before 'to', period high/low, z-score vs the asset's typical move, leaders/laggards, unusual moves, and cross-asset divergences (e.g. gold falling while real yields fall). Default period: the current week (on weekends — the week just finished).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "YYYY-MM-DD. Default: Monday of the current week." },
+        to: { type: "string", description: "YYYY-MM-DD. Default: today." },
+        assets: { type: "array", items: { type: "string" }, maxItems: 25, description: `Asset keys, Yahoo symbols or 'macro:<key>'. Default: ${PERIOD_DEFAULT_ASSETS.join(", ")}.` },
+        include_daily: { type: "boolean", description: "Include day-by-day closes. Default false." },
+        include_divergences: { type: "boolean", description: "Run the divergence detector over all known relationships. Default true." },
+      },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
+    name: "divergences",
+    description: `Cross-asset divergence detector: for each relationship checks whether the asset moved as its driver implies over the period. Statuses: divergence (both moved, wrong direction), non_confirmation (driver moved a lot, asset ignored it), consistent, quiet. Also flags 60d-vs-250d correlation regime shifts. Relationships: ${Object.entries(RELATIONSHIPS).map(([k, r]) => `${k} (${r.asset}←${r.driver})`).join(", ")}.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        relationships: { type: "array", items: { type: "string", enum: Object.keys(RELATIONSHIPS) }, description: "Default: all." },
+        from: { type: "string", description: "YYYY-MM-DD. Default: Monday of the current week." },
+        to: { type: "string", description: "YYYY-MM-DD. Default: today." },
+      },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
     name: "analyst_brief",
     description:
       `One-call research pack for a coverage area: market snapshots, macro series, cross-asset correlations, rule-based signals, key drivers and (optionally) GDELT news tone + headlines. Directions: ${dirList.join(", ")}. With news, takes ~10–35s due to GDELT rate limits.`,
@@ -463,6 +642,8 @@ export const ANALYST_TOOLS = [
         include_news: { type: "boolean", description: "Fetch GDELT tone + headlines. Default true." },
         news_timespan: { type: "string", description: "GDELT lookback, e.g. '24h', '3d', '7d'. Default '7d'." },
         headlines: { type: "integer", minimum: 1, maximum: 10, description: "Headlines per news theme. Default 5." },
+        from: { type: "string", description: "Divergence-check period start, YYYY-MM-DD. Default: 6 days before 'to'." },
+        to: { type: "string", description: "Divergence-check period end, YYYY-MM-DD. Default: today." },
       },
       required: ["direction"],
     },
@@ -489,11 +670,18 @@ export async function callAnalystTool(name, args, ctx) {
     const range = w > 200 ? "2y" : "1y";
     const res = await settle((args.pairs || []).slice(0, 8), async ([x, y]) => {
       const [a, b] = await Promise.all([assetSeries(x, range), assetSeries(y, range)]);
-      return { pair: `${x}/${y}`, window: w, ...(correlation(a.pts, b.pts, w) || { corr: null, note: "not enough overlapping data" }) };
+      return { pair: `${x}/${y}`, window: w, ...(correlation(a.pts, b.pts, w, a.kind, b.kind) || { corr: null, note: "not enough overlapping data" }) };
     });
     return { correlations: res.map((r) => (r.error ? { pair: r.key.join("/"), error: r.error } : r)) };
   }
   if (name === "analyst_brief") return buildBrief(args.direction, args, ctx?.news);
+  if (name === "period_report") return periodReport(args);
+  if (name === "divergences") {
+    const to = args.to || today();
+    const from = args.from || weekStart(to);
+    checkPeriod(from, to);
+    return { period: { from, to }, divergences: await detectDivergences(args.relationships?.length ? args.relationships : Object.keys(RELATIONSHIPS), from, to) };
+  }
   return undefined;
 }
 
@@ -501,7 +689,8 @@ export async function callAnalystTool(name, args, ctx) {
 const ANALYST_PROMPT = `Ты — Argus, макро- и геополитический аналитик. Покрытие: ${Object.values(DIRECTIONS).map((d) => d.title).join("; ")}.
 
 ПРАВИЛА РАБОТЫ
-1. Сначала данные, потом мнение. Для каждого направления вызывай analyst_brief; для точечных вопросов — market_snapshot, macro_indicator, us_debt, asset_correlation, gdelt_search/gdelt_tone/gdelt_compare.
+1. Сначала данные, потом мнение. Для каждого направления вызывай analyst_brief; для итогов за период (неделя, «с понедельника по пятницу») — period_report; для точечных вопросов — market_snapshot, macro_indicator, us_debt, asset_correlation, divergences, gdelt_search/gdelt_tone/gdelt_compare.
+2a. Самое ценное — расхождения (status divergence / non_confirmation): когда актив НЕ реагирует на свой драйвер, объясни почему. Это важнее, чем пересказ движения цен.
 2. Помечай каждое утверждение: [Факт] — число из инструмента с датой as_of; [Вывод] — логическое следствие из данных; [Гипотеза] — твоя интерпретация без прямого подтверждения.
 3. Всегда указывай дату данных. Если показатель старше месяца (макро) или 3 дней (рынок) — скажи об этом.
 4. Связывай направления: ФРС → доходности → доллар → золото/BTC/акции; нефть → инфляция → ФРС; войны → нефть/золото/VIX; госдолг → срочная премия → длинные бумаги.

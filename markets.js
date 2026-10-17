@@ -175,12 +175,15 @@ export function shiftDate(iso, days) {
   return new Date(Date.parse(iso) + days * 86400_000).toISOString().slice(0, 10);
 }
 
-// Daily-return correlation over the last `window` common dates.
-export function correlation(a, b, window = 60) {
+// One-step move: log return for prices, plain difference for yields/rates.
+const move = (prev, cur, kind) => (kind === "yield" ? cur - prev : Math.log(cur / prev));
+
+// Daily-move correlation over the last `window` common dates (optionally ending at `asOf`).
+export function correlation(a, b, window = 60, kindA = "price", kindB = "price", asOf) {
   const mb = new Map(b.map((p) => [p.date, p.value]));
-  const common = a.filter((p) => mb.has(p.date)).map((p) => [p.value, mb.get(p.date)]);
+  const common = a.filter((p) => mb.has(p.date) && (!asOf || p.date <= asOf)).map((p) => [p.value, mb.get(p.date)]);
   const rets = [];
-  for (let i = 1; i < common.length; i++) rets.push([common[i][0] / common[i - 1][0] - 1, common[i][1] / common[i - 1][1] - 1]);
+  for (let i = 1; i < common.length; i++) rets.push([move(common[i - 1][0], common[i][0], kindA), move(common[i - 1][1], common[i][1], kindB)]);
   const w = rets.slice(-window);
   if (w.length < 10) return null;
   const mx = w.reduce((s, r) => s + r[0], 0) / w.length;
@@ -192,6 +195,48 @@ export function correlation(a, b, window = 60) {
     syy += (y - my) ** 2;
   }
   return sxx && syy ? { corr: r2(sxy / Math.sqrt(sxx * syy), 3), observations: w.length } : null;
+}
+
+// ---------- period analytics ----------
+// Change from the last close BEFORE `from` (e.g. previous Friday) to the last close on/before `to`.
+// z = move / (typical daily move × √days): how unusual the move is for this asset.
+export function periodChange(pts, from, to, kind = "price") {
+  const baseIdx = pts.findLastIndex((p) => p.date < from);
+  const endIdx = pts.findLastIndex((p) => p.date <= to);
+  if (baseIdx < 0) throw new Error(`no data before ${from}`);
+  if (endIdx <= baseIdx) throw new Error(`no data between ${from} and ${to}`);
+  const base = pts[baseIdx], end = pts[endIdx];
+  const inside = pts.slice(baseIdx + 1, endIdx + 1);
+  const vals = inside.map((p) => p.value);
+  const days = endIdx - baseIdx;
+  // Volatility is measured on the year BEFORE the period, so the period's own shock doesn't mute its z-score.
+  const moves = [];
+  for (let i = Math.max(1, baseIdx - 250); i <= baseIdx; i++) moves.push(move(pts[i - 1].value, pts[i].value, kind));
+  const sd = stdev(moves.filter(Number.isFinite));
+  const total = move(base.value, end.value, kind);
+  return {
+    start_date: base.date,
+    start: r2(base.value, 4),
+    end_date: end.date,
+    end: r2(end.value, 4),
+    change_unit: kind === "yield" ? "bp" : "%",
+    change: kind === "yield" ? r2((end.value - base.value) * 100, 1) : r2((end.value / base.value - 1) * 100),
+    period_high: r2(Math.max(...vals), 4),
+    period_low: r2(Math.min(...vals), 4),
+    trading_days: days,
+    z_score: sd ? r2(total / (sd * Math.sqrt(days))) : null,
+    daily: inside.map((p, i) => ({
+      date: p.date,
+      value: r2(p.value, 4),
+      change: kind === "yield" ? r2((p.value - (i ? inside[i - 1] : base).value) * 100, 1) : r2((p.value / (i ? inside[i - 1] : base).value - 1) * 100),
+    })),
+  };
+}
+
+function stdev(xs) {
+  if (xs.length < 10) return null;
+  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
 }
 
 // Transforms for macro series: 'level', 'yoy' (index → % y/y), 'diff' (m/m change, e.g. payrolls), 'saar' (q/q annualized).

@@ -11,7 +11,7 @@ const MCP_PATH = PATH_TOKEN ? `/mcp/${PATH_TOKEN}` : "/mcp";
 const GDELT_URL = process.env.GDELT_URL || "https://api.gdeltproject.org/api/v2/doc/doc";
 const MIN_INTERVAL_MS = Number(process.env.GDELT_MIN_INTERVAL_MS || 5500);
 const FETCH_TIMEOUT_MS = 25000;
-const SERVER_INFO = { name: "gdelt-mcp-argus", version: "1.1.0" };
+const SERVER_INFO = { name: "gdelt-mcp-argus", version: "1.2.0" };
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 // ---------- GDELT client with a serial rate-limit queue ----------

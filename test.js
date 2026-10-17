@@ -30,10 +30,47 @@ function fredCsv(id) {
   return lines.join("\n");
 }
 
+// Scenario mode: per-symbol random walks with a scripted final week (mimics Oct 12–16, 2026).
+let SCENARIO = null;
+function walk(seed, n, start, sd, lastWeek, kind = "price") {
+  let x = seed;
+  const rnd = () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648) * 2 - 1;
+  const vals = [start];
+  for (let i = 1; i < n; i++) {
+    const shock = i >= n - lastWeek.length ? lastWeek[i - (n - lastWeek.length)] : null;
+    const step = shock ?? rnd() * sd * 1.7;
+    vals.push(kind === "yield" ? vals[i - 1] + step : vals[i - 1] * Math.exp(step));
+  }
+  return vals;
+}
+const scenarioDate = (i, n) => new Date(END + DAY - (n - 1 - i) * DAY).toISOString().slice(0, 10); // ends Fri 2026-10-16
+function scenarioYahoo(sym) {
+  const sc = SCENARIO?.yahoo?.[sym];
+  if (!sc) return null;
+  const n = 400, vals = walk(sc.seed, n, sc.start, sc.sd, sc.week);
+  const timestamp = vals.map((_, i) => Date.parse(scenarioDate(i, n)) / 1000);
+  return { chart: { result: [{ meta: {}, timestamp, indicators: { quote: [{ close: vals }] } }] } };
+}
+function scenarioFred(id) {
+  const sc = SCENARIO?.fred?.[id];
+  if (!sc) return null;
+  const n = 400, vals = walk(sc.seed, n, sc.start, sc.sd, sc.week, "yield");
+  return ["observation_date," + id, ...vals.map((v, i) => `${scenarioDate(i, n)},${v.toFixed(4)}`)].join("\n");
+}
+
 globalThis.fetch = async (url) => {
   url = String(url);
   calls.push(url);
   const reply = (status, body) => ({ status, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
+  if (url.includes("finance.yahoo.com") && SCENARIO) {
+    const sym = decodeURIComponent(url.split("/chart/")[1].split("?")[0]);
+    const sc = scenarioYahoo(sym);
+    if (sc) return reply(200, sc);
+  }
+  if (url.includes("fredgraph.csv") && SCENARIO) {
+    const sc = scenarioFred(new URL(url).searchParams.get("id"));
+    if (sc) return reply(200, sc);
+  }
   if (url.includes("finance.yahoo.com")) {
     if (url.includes("GDAXI")) return reply(429, "Too Many Requests");
     return reply(200, yahooChart());
@@ -54,7 +91,8 @@ globalThis.fetch = async (url) => {
 };
 
 const { handleRpc } = await import("./server.js");
-const { priceStats, macroStats, correlation, clearCache } = await import("./markets.js");
+const { priceStats, macroStats, correlation, periodChange, clearCache } = await import("./markets.js");
+const { weekStart } = await import("./analyst.js");
 const rpc = async (method, params) => (await handleRpc({ jsonrpc: "2.0", id: 1, method, params })).result;
 const tool = async (name, args) => {
   const r = await rpc("tools/call", { name, arguments: args });
@@ -172,6 +210,96 @@ await test("analyst_brief: every direction builds", async () => {
 await test("analyst_brief: unknown direction is a tool error", async () => {
   const r = await rpc("tools/call", { name: "analyst_brief", arguments: { direction: "nope" } });
   assert.equal(r.isError, true);
+});
+
+await test("periodChange: base is last close before 'from', z-score uses prior-year vol", () => {
+  const pts = [];
+  for (let i = 0; i < 300; i++) pts.push({ date: new Date(END - (299 - i) * DAY).toISOString().slice(0, 10), value: 100 * (1 + 0.01 * (i % 2 ? 1 : -1)) });
+  const last = pts.length - 1;
+  pts[last].value = 110;
+  const from = pts[last - 4].date, to = pts[last].date;
+  const pc = periodChange(pts, from, to);
+  assert.equal(pc.start_date, pts[last - 5].date);
+  assert.equal(pc.trading_days, 5);
+  assert.equal(pc.daily.length, 5);
+  assert.ok(pc.z_score > 2, `z=${pc.z_score}`);
+  const y = periodChange(pts.map((p) => ({ ...p, value: p.value / 20 })), from, to, "yield");
+  assert.equal(y.change_unit, "bp");
+  assert.throws(() => periodChange(pts, "1990-01-01", "1990-02-01"), /no data before/);
+});
+
+await test("weekStart: Monday of current week, weekends map to the week just finished", () => {
+  assert.equal(weekStart("2026-10-17"), "2026-10-12"); // Sat
+  assert.equal(weekStart("2026-10-18"), "2026-10-12"); // Sun
+  assert.equal(weekStart("2026-10-14"), "2026-10-12"); // Wed
+  assert.equal(weekStart("2026-10-19"), "2026-10-19"); // Mon
+});
+
+const WEEK = (total, kind = "price") => Array(5).fill(kind === "yield" ? total / 5 : Math.log(1 + total) / 5);
+const LAST_WEEK = {
+  yahoo: {
+    "GC=F": { seed: 1, start: 4000, sd: 0.01, week: WEEK(-0.03) }, // gold −3% …
+    "^NDX": { seed: 2, start: 30000, sd: 0.012, week: WEEK(-0.05) },
+    "BTC-USD": { seed: 3, start: 80000, sd: 0.025, week: [0, 0, 0, 0, 0] }, // … BTC flat while Nasdaq −5%
+    "^VIX": { seed: 4, start: 15, sd: 0.05, week: WEEK(0.35) },
+    "^GSPC": { seed: 5, start: 7800, sd: 0.009, week: WEEK(-0.02) },
+    "DX-Y.NYB": { seed: 6, start: 100, sd: 0.004, week: WEEK(-0.004) },
+  },
+  fred: { DFII10: { seed: 7, start: 2.9, sd: 0.04, week: WEEK(-0.15, "yield") } }, // … while real yields fall 15bp
+};
+
+await test("period_report: Mon–Fri changes, leaders/laggards, unusual moves", async () => {
+  SCENARIO = LAST_WEEK;
+  try {
+    const r = await tool("period_report", { from: "2026-10-12", to: "2026-10-16", assets: ["gold", "ndx", "btc", "vix", "dax", "macro:real_yield_10y"], include_divergences: false, include_daily: true });
+    const by = Object.fromEntries(r.assets.map((a) => [a.asset, a]));
+    assert.equal(by.gold.start_date, "2026-10-11");
+    assert.equal(by.gold.end_date, "2026-10-16");
+    assert.equal(by.gold.change, -3);
+    assert.equal(by.ndx.change, -5);
+    assert.equal(by.btc.change, 0);
+    assert.equal(by["macro:real_yield_10y"].change, -15);
+    assert.equal(by["macro:real_yield_10y"].change_unit, "bp");
+    assert.equal(by.gold.daily.length, 5);
+    assert.match(by.dax.error, /429/);
+    assert.match(r.leaders[0], /Bitcoin/);
+    assert.match(r.laggards[0], /Nasdaq/);
+    assert.ok(r.unusual_moves.some((m) => m.startsWith("Nasdaq")), r.unusual_moves.join("|"));
+    assert.equal(r.divergences, undefined);
+  } finally {
+    SCENARIO = null;
+  }
+});
+
+await test("divergences: catches last week's anomalies", async () => {
+  SCENARIO = LAST_WEEK;
+  try {
+    const r = await tool("divergences", { from: "2026-10-12", to: "2026-10-16" });
+    const by = Object.fromEntries(r.divergences.map((d) => [d.id, d]));
+    assert.equal(by.gold_real_yield.status, "divergence", JSON.stringify(by.gold_real_yield));
+    assert.equal(by.gold_haven.status, "divergence"); // gold down while VIX spikes
+    assert.equal(by.btc_nasdaq.status, "non_confirmation", JSON.stringify(by.btc_nasdaq));
+    assert.equal(by.equities_vix.status, "consistent");
+    assert.equal(by.dax_us.status, "error");
+    assert.equal(r.divergences[0].status, "divergence"); // sorted most important first
+    const bad = await rpc("tools/call", { name: "divergences", arguments: { from: "2026-10-16", to: "2026-10-12" } });
+    assert.equal(bad.isError, true);
+  } finally {
+    SCENARIO = null;
+  }
+});
+
+await test("analyst_brief: divergences surface as signals", async () => {
+  SCENARIO = LAST_WEEK;
+  try {
+    const r = await tool("analyst_brief", { direction: "gold", include_news: false, from: "2026-10-12", to: "2026-10-16" });
+    assert.deepEqual(r.divergence_period, { from: "2026-10-12", to: "2026-10-16" });
+    assert.ok(r.signals.some((s) => s.startsWith("РАСХОЖДЕНИЕ: gold")), r.signals.join("|"));
+    const b = await tool("analyst_brief", { direction: "bitcoin", include_news: false, from: "2026-10-12", to: "2026-10-16" });
+    assert.ok(b.signals.some((s) => s.startsWith("НЕ ПОДТВЕРЖДЕНО: ndx")), b.signals.join("|"));
+  } finally {
+    SCENARIO = null;
+  }
 });
 
 console.log(`\n${passed} tests passed`);

@@ -27,6 +27,20 @@ No API keys required.
 - `macro_indicator(indicators)` — FRED series with y/y, m/m, q/q SAAR transforms. Any FRED id works.
 - `us_debt()` — Treasury debt totals and changes.
 - `asset_correlation(pairs)` — rolling return correlation.
+- `period_report(from, to, assets)` — performance over any period (default: current week, Mon–Fri): change vs last close before `from`, period high/low, z-score vs the asset's typical move, leaders/laggards, unusual moves, divergences.
+- `divergences(from, to, relationships)` — cross-asset divergence detector (see below).
+
+## Divergence detector
+
+Each relationship says how an asset should respond to its driver (e.g. gold ← real yield: opposite). For the period, both moves are scaled by their typical move over the prior year (z-score):
+
+| status | meaning |
+|---|---|
+| `divergence` | both moved ≥ 0.75σ, in the wrong direction (gold ↓ while real yields ↓) |
+| `non_confirmation` | driver moved ≥ 1σ, asset barely responded (Nasdaq −5%, BTC flat) |
+| `consistent` / `quiet` | relationship held / driver didn't move enough to judge |
+
+It also flags correlation regime shifts (60-day vs 250-day). `analyst_brief` runs the relevant relationships over the last week and adds the findings to `signals`.
 - `gdelt_search`, `gdelt_tone`, `gdelt_compare` — news coverage and tone.
 
 Prompt `argus_analyst` (args `direction`, `horizon`) holds the analyst methodology and output format.
