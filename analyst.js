@@ -129,10 +129,17 @@ export async function detectDivergences(ids, from, to) {
       row.driver_change = `${pd.change}${pd.change_unit}`;
       row.asset_z = pa.z_score;
       row.driver_z = pd.z_score;
-      if (pa.end_date !== pd.end_date) row.note = `data end dates differ: ${pa.end_date} vs ${pd.end_date}`;
+      const fallback = [A, D].filter((x) => /fallback is/.test(x.source)).map((x) => x.source);
       // Asset's response in the expected direction, measured in its own sigmas.
       const response = pa.z_score !== null && pd.z_score !== null ? pa.z_score * r.expect * Math.sign(pd.z_score) : null;
-      if (response === null) row.status = "insufficient history";
+      // Don't judge a relationship on mismatched windows or substitute series — that's how false signals are born.
+      if (pa.end_date !== pd.end_date) {
+        row.status = "misaligned";
+        row.note = `data end dates differ: ${r.asset} ${pa.end_date} vs ${r.driver} ${pd.end_date}`;
+      } else if (fallback.length) {
+        row.status = "unreliable_source";
+        row.note = fallback.join("; ");
+      } else if (response === null) row.status = "insufficient history";
       else if (Math.abs(pd.z_score) < DIV_Z) row.status = "quiet";
       else if (response <= -DIV_Z) row.status = "divergence";
       else if (Math.abs(pd.z_score) >= NONCONF_DRIVER_Z && response < NONCONF_ASSET_Z) row.status = "non_confirmation";
@@ -151,7 +158,7 @@ export async function detectDivergences(ids, from, to) {
     }
     out.push(row);
   }
-  const rank = { divergence: 0, non_confirmation: 1, consistent: 2, quiet: 3, "insufficient history": 4, error: 5 };
+  const rank = { divergence: 0, non_confirmation: 1, consistent: 2, quiet: 3, misaligned: 4, unreliable_source: 5, "insufficient history": 6, error: 7 };
   return out.sort((a, b) => rank[a.status] - rank[b.status] || Math.abs(b.driver_z || 0) - Math.abs(a.driver_z || 0));
 }
 
@@ -187,7 +194,9 @@ export async function periodReport({ from, to, assets, include_daily = false, in
   const priced = rows.filter((r) => !r.error && r.change_unit === "%" && r.asset !== "vix");
   const byChange = [...priced].sort((a, b) => b.change - a.change);
   const unusual = rows.filter((r) => !r.error && r.z_score !== null && Math.abs(r.z_score) >= 1.5).map((r) => `${r.name}: ${r.change}${r.change_unit} (z=${r.z_score})`);
+  const stale = rows.filter((r) => r.stale).map((r) => `${r.name}: ${r.stale_note}`);
   const out = {
+    ...(stale.length ? { data_warnings: stale } : {}),
     period: { from, to, note: "change = last close before 'from' → last close on/before 'to'; z_score = move vs typical move of the prior year" },
     assets: rows,
     leaders: byChange.slice(0, 3).map((r) => `${r.name} ${r.change}%`),
@@ -620,7 +629,7 @@ export const ANALYST_TOOLS = [
   },
   {
     name: "divergences",
-    description: `Cross-asset divergence detector: for each relationship checks whether the asset moved as its driver implies over the period. Statuses: divergence (both moved, wrong direction), non_confirmation (driver moved a lot, asset ignored it), consistent, quiet. Also flags 60d-vs-250d correlation regime shifts. Relationships: ${Object.entries(RELATIONSHIPS).map(([k, r]) => `${k} (${r.asset}←${r.driver})`).join(", ")}.`,
+    description: `Cross-asset divergence detector: for each relationship checks whether the asset moved as its driver implies over the period. Statuses: divergence (both moved, wrong direction), non_confirmation (driver moved a lot, asset ignored it), consistent, quiet; misaligned (legs end on different dates) and unreliable_source (a leg uses a substitute series, e.g. spot instead of futures) are deliberately not judged. Also flags 60d-vs-250d correlation regime shifts. Relationships: ${Object.entries(RELATIONSHIPS).map(([k, r]) => `${k} (${r.asset}←${r.driver})`).join(", ")}.`,
     inputSchema: {
       type: "object",
       properties: {

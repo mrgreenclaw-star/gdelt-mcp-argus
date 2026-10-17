@@ -200,9 +200,19 @@ export function correlation(a, b, window = 60, kindA = "price", kindB = "price",
 // ---------- period analytics ----------
 // Change from the last close BEFORE `from` (e.g. previous Friday) to the last close on/before `to`.
 // z = move / (typical daily move × √days): how unusual the move is for this asset.
+// Last Mon–Fri date strictly before / on or before `iso`.
+const isWeekend = (iso) => [0, 6].includes(new Date(`${iso}T00:00:00Z`).getUTCDay());
+export function weekdayOnOrBefore(iso) {
+  while (isWeekend(iso)) iso = shiftDate(iso, -1);
+  return iso;
+}
+export const weekdayBefore = (iso) => weekdayOnOrBefore(shiftDate(iso, -1));
+
 export function periodChange(pts, from, to, kind = "price") {
-  const baseIdx = pts.findLastIndex((p) => p.date < from);
-  const endIdx = pts.findLastIndex((p) => p.date <= to);
+  // Anchor on weekdays so 24/7 assets (crypto) compare Friday-to-Friday like everything else.
+  const baseDate = weekdayBefore(from), endDate = weekdayOnOrBefore(to);
+  const baseIdx = pts.findLastIndex((p) => p.date <= baseDate);
+  const endIdx = pts.findLastIndex((p) => p.date <= endDate);
   if (baseIdx < 0) throw new Error(`no data before ${from}`);
   if (endIdx <= baseIdx) throw new Error(`no data between ${from} and ${to}`);
   const base = pts[baseIdx], end = pts[endIdx];
@@ -224,6 +234,7 @@ export function periodChange(pts, from, to, kind = "price") {
     period_high: r2(Math.max(...vals), 4),
     period_low: r2(Math.min(...vals), 4),
     trading_days: days,
+    ...(end.date < endDate ? { stale: true, stale_note: `latest data is ${end.date}, period ends ${endDate} — source lags` } : {}),
     z_score: sd ? r2(total / (sd * Math.sqrt(days))) : null,
     daily: inside.map((p, i) => ({
       date: p.date,

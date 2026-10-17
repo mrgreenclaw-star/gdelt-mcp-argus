@@ -43,7 +43,15 @@ function walk(seed, n, start, sd, lastWeek, kind = "price") {
   }
   return vals;
 }
-const scenarioDate = (i, n) => new Date(END + DAY - (n - 1 - i) * DAY).toISOString().slice(0, 10); // ends Fri 2026-10-16
+// Business days ending Fri 2026-10-16.
+const scenarioDate = (i, n) => {
+  let d = Date.parse("2026-10-16T00:00:00Z"), left = n - 1 - i;
+  while (left > 0) {
+    d -= DAY;
+    if (![0, 6].includes(new Date(d).getUTCDay())) left--;
+  }
+  return new Date(d).toISOString().slice(0, 10);
+};
 function scenarioYahoo(sym) {
   const sc = SCENARIO?.yahoo?.[sym];
   if (!sc) return null;
@@ -214,7 +222,7 @@ await test("analyst_brief: unknown direction is a tool error", async () => {
 
 await test("periodChange: base is last close before 'from', z-score uses prior-year vol", () => {
   const pts = [];
-  for (let i = 0; i < 300; i++) pts.push({ date: new Date(END - (299 - i) * DAY).toISOString().slice(0, 10), value: 100 * (1 + 0.01 * (i % 2 ? 1 : -1)) });
+  for (let i = 0; i < 300; i++) pts.push({ date: scenarioDate(i, 300), value: 100 * (1 + 0.01 * (i % 2 ? 1 : -1)) });
   const last = pts.length - 1;
   pts[last].value = 110;
   const from = pts[last - 4].date, to = pts[last].date;
@@ -226,6 +234,15 @@ await test("periodChange: base is last close before 'from', z-score uses prior-y
   const y = periodChange(pts.map((p) => ({ ...p, value: p.value / 20 })), from, to, "yield");
   assert.equal(y.change_unit, "bp");
   assert.throws(() => periodChange(pts, "1990-01-01", "1990-02-01"), /no data before/);
+  // 24/7 asset: base is Friday's close, not Sunday's; weekend 'to' snaps back to Friday.
+  const crypto = ["2026-10-08", "2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-16", "2026-10-17"].map((date, i) => ({ date, value: [90, 100, 50, 60, 101, 110, 999][i] }));
+  const c = periodChange(crypto, "2026-10-12", "2026-10-17");
+  assert.equal(c.start_date, "2026-10-09");
+  assert.equal(c.end_date, "2026-10-16");
+  assert.equal(c.change, 10);
+  // Lagging source is flagged as stale.
+  const lag = periodChange(crypto.slice(0, 5), "2026-10-12", "2026-10-16");
+  assert.equal(lag.stale, true);
 });
 
 await test("weekStart: Monday of current week, weekends map to the week just finished", () => {
@@ -253,7 +270,7 @@ await test("period_report: Mon–Fri changes, leaders/laggards, unusual moves", 
   try {
     const r = await tool("period_report", { from: "2026-10-12", to: "2026-10-16", assets: ["gold", "ndx", "btc", "vix", "dax", "macro:real_yield_10y"], include_divergences: false, include_daily: true });
     const by = Object.fromEntries(r.assets.map((a) => [a.asset, a]));
-    assert.equal(by.gold.start_date, "2026-10-11");
+    assert.equal(by.gold.start_date, "2026-10-09");
     assert.equal(by.gold.end_date, "2026-10-16");
     assert.equal(by.gold.change, -3);
     assert.equal(by.ndx.change, -5);
